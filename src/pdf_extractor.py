@@ -235,20 +235,81 @@ _RIDER_CLAUSE_NUM_RE = re.compile(r"^(\d+)\s*[.)]+\s*(.*)")
 # is treated as body text and the title is left empty.
 RIDER_INLINE_TITLE_MAX_LEN = 60
 
-# Known section headers in the rider pages and their short prefix codes.
-_RIDER_SECTIONS: List[Tuple[str, str]] = [
-    ("SHELL ADDITIONAL", "SAC"),
-    ("ESSAR RIDER",      "ERC"),
-]
+# In single-column pages, body text sits at x ≈ 50–149 pt.  Real section
+# headers (visually centred on the page) start at x ≥ 150 pt.  This gap is
+# measured from the actual document; for other PDFs with different margins the
+# constant can be adjusted.
+SECTION_HEADER_MIN_X = 150.0
+
+# A section-header candidate must contain at least this many characters to
+# eliminate single-word fragments (e.g. "INDEPENDENT", "DIFFER,") that appear
+# at high x-offsets due to table or list formatting.
+SECTION_HEADER_MIN_LEN = 10
+
+# A clause-number sequence is considered to have "reset" when the new number
+# is at most this value and the previous maximum was at least this value.
+# Detecting a reset lets us open a new section even when the header is absent
+# or uses an unrecognised string.
+SECTION_RESET_NEW_MAX = 3
+SECTION_RESET_PREV_MIN = 5
+
+# Words excluded from prefix generation (common English stop-words and
+# ordinal/month suffixes that add no distinguishing value).
+_PREFIX_STOP_WORDS = {
+    "THE", "AND", "OF", "FOR", "IN", "TO", "A", "AN", "AT", "BY",
+    "IS", "ARE", "ST", "ND", "RD", "TH",
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+}
 
 
-def _detect_rider_section(text: str) -> Optional[str]:
-    """Return the section prefix if *text* is a known rider section header."""
-    upper = text.upper()
-    for keyword, prefix in _RIDER_SECTIONS:
-        if keyword in upper:
-            return prefix
-    return None
+def _is_section_header(text: str, x0: float) -> bool:
+    """Return True when *text* looks like a section-break heading.
+
+    All of the following must hold:
+
+    * ``x0 >= SECTION_HEADER_MIN_X`` — the line starts to the right of normal
+      body text (body text sits at x ≈ 50–149 pt; headers are centred at
+      x ≥ 150 pt).
+    * ``len(text) >= SECTION_HEADER_MIN_LEN`` — long enough to be a title (not
+      a stray word or fragment from table formatting).
+    * Does not start with a lower-case letter — section headers are always
+      proper-case or all-caps; body-text continuations often start lower-case.
+    * Is not itself a numbered clause starter.
+
+    No specific section names are hard-coded; the detection is purely
+    structural, so any new section in any document will be picked up.
+    """
+    stripped = text.strip()
+    if len(stripped) < SECTION_HEADER_MIN_LEN:
+        return False
+    if stripped[0].islower():
+        return False
+    if _RIDER_CLAUSE_NUM_RE.match(stripped):
+        return False
+    return x0 >= SECTION_HEADER_MIN_X
+
+
+def _prefix_from_header(text: str) -> str:
+    """Derive a short section prefix from a header string.
+
+    Takes the first letter of each significant word (length > 2, not a stop
+    word) and returns up to three initials, upper-cased.
+
+    Examples
+    --------
+    ``"SHELL ADDITIONAL CLAUSES - 1st February, 1999"`` → ``"SAC"``
+    ``"Essar Rider Clauses (1st Dec 2006)"``             → ``"ERC"``
+    ``"Special Provisions Section"``                     → ``"SPS"``
+    ``"Maritime Freight Addendum"``                      → ``"MFA"``
+    """
+    words = re.findall(r"[A-Za-z]+", text)
+    initials = [
+        w[0].upper()
+        for w in words
+        if w.upper() not in _PREFIX_STOP_WORDS and len(w) > 2
+    ]
+    return "".join(initials[:3]) if initials else "SEC"
 
 
 def _has_two_column_layout(page: fitz.Page) -> bool:
@@ -422,14 +483,37 @@ def _extract_single_column_clauses(
     Sub-clause labels (``1)``, ``2)``, ``(A)`` …) sit at a deeper x-coordinate
     and are incorporated into the clause body text.
     """
-    current_section = "SAC"  # sensible default; overridden by any section header
+    # ------------------------------------------------------------------ #
+    # State variables                                                     #
+    # ------------------------------------------------------------------ #
+    section_counter = 0          # increments every time a new section opens
+    current_section = ""         # prefix for the open section (e.g. "SAC")
+    pending_header: Optional[str] = None  # header candidate seen since last body line
+    body_since_header = False    # True once body text is added after pending_header
+
     current_id: Optional[str] = None
-    current_id_section = "SAC"  # snapshot the section when the clause starts
+    current_id_section = ""      # section snapshotted when the clause started
     current_title: Optional[str] = None
     current_body_parts: List[str] = []
-    awaiting_title = False  # True when we have a number but no title yet
+    awaiting_title = False
+
+    # Tracking for numbering-reset detection
+    section_max_num = 0          # highest clause number seen in current section
+    section_clause_count = 0     # how many clauses we have opened in this section
 
     clauses: List[RawClause] = []
+
+    def _open_section(header_text: Optional[str]) -> str:
+        """Start a new section and return its prefix.
+
+        The prefix is derived from *header_text* when provided; otherwise a
+        sequential fallback label ``S1``, ``S2``, … is used.
+        """
+        nonlocal section_counter, section_max_num, section_clause_count
+        section_counter += 1
+        section_max_num = 0
+        section_clause_count = 0
+        return _prefix_from_header(header_text) if header_text else f"S{section_counter}"
 
     def _flush() -> None:
         if current_id is not None and current_body_parts:
@@ -485,19 +569,54 @@ def _extract_single_column_clauses(
                 if not text.strip():
                     continue
 
-                # Detect section header (updates current_section, not a clause line)
-                section = _detect_rider_section(text)
-                if section:
-                    current_section = section
+                # ---------------------------------------------------- #
+                # Section header detection (position-based, generic)   #
+                # ---------------------------------------------------- #
+                if _is_section_header(text, x0):
+                    # Record as a candidate; only activate when a numbered
+                    # clause follows with no intervening body text.
+                    pending_header = text
+                    body_since_header = False
+                    logger.debug("Section header candidate: %s", text[:60])
                     continue
 
-                # Detect top-level clause starter: number at leftmost margin
+                # ---------------------------------------------------- #
+                # Top-level clause starter: number at leftmost margin   #
+                # ---------------------------------------------------- #
                 if x0 < RIDER_NUM_X_MAX:
                     m = _RIDER_CLAUSE_NUM_RE.match(text)
                     if m:
+                        new_num = int(m.group(1))
+
+                        # Detect numbering reset even without an explicit header
+                        numbering_reset = (
+                            new_num <= SECTION_RESET_NEW_MAX
+                            and section_max_num >= SECTION_RESET_PREV_MIN
+                            and section_clause_count >= SECTION_RESET_PREV_MIN
+                        )
+
+                        # A header candidate is valid only when NO body text
+                        # has been added since it was seen.  If body text did
+                        # follow, the "header" was inside a clause body — discard it.
+                        valid_header = pending_header and not body_since_header
+
+                        if valid_header or (not current_section) or numbering_reset:
+                            current_section = _open_section(
+                                pending_header if valid_header else None
+                            )
+                            logger.debug(
+                                "Opened section %r (reset=%s, header=%r)",
+                                current_section, numbering_reset,
+                                pending_header if valid_header else None,
+                            )
+                        pending_header = None
+                        body_since_header = False
+
                         _flush()
                         current_id = m.group(1)
                         current_id_section = current_section  # snapshot section at start
+                        section_max_num = max(section_max_num, new_num)
+                        section_clause_count += 1
                         inline_text = m.group(2).strip()
                         if inline_text and len(inline_text) <= RIDER_INLINE_TITLE_MAX_LEN:
                             # Short inline text → it is the clause title
@@ -526,6 +645,7 @@ def _extract_single_column_clauses(
                     continue
 
                 current_body_parts.append(text)
+                body_since_header = True  # body text followed → discard any pending header
 
     _flush()
     logger.info("Single-column parser: %d clauses from %d pages", len(clauses), len(page_nums))
