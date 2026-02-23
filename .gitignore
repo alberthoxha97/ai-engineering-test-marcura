@@ -1,8 +1,32 @@
+# Secrets
 .env
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
 .venv/
 venv/
-*.egg-info/
+env/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project-specific: generated output and source PDF
+output.json
+voyage-charter-example.pdf
+
