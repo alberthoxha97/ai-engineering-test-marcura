@@ -1,5 +1,5 @@
 {
-  "total_clauses": 84,
+  "total_clauses": 86,
   "clauses": [
     {
       "id": "1",
@@ -402,9 +402,14 @@
       "text": "Owners confirm vessel is free of encumbrances / accident /   pollution claims."
     },
     {
+      "id": "ERC-16",
+      "title": "",
+      "text": "All voyage instructions and changes to same to be sent by telex/Fax/E mail only."
+    },
+    {
       "id": "ERC-17",
-      "title": "If acceptable by Suppliers, otherwise Master to issue Letter of Protest - to be inserted in all original",
-      "text": "Bill(s) of Lading issued and presented to Master : 'All terms, conditions, liberties and exceptions of the Charter Party including the Arbitration Clause are herewith incorporated, as per Charter Party dated 03/03/2010."
+      "title": "",
+      "text": "If acceptable by Suppliers, otherwise Master to issue Letter of Protest - to be inserted in all original Bill(s) of Lading issued and presented to Master : 'All terms, conditions, liberties and exceptions of the Charter Party including the Arbitration Clause are herewith incorporated, as per Charter Party dated 03/03/2010."
     },
     {
       "id": "ERC-19",
@@ -418,8 +423,13 @@
     },
     {
       "id": "ERC-21",
-      "title": "Owners confirm that all officers on board hold ocean going vessel certificate of competency. Also",
-      "text": "confirm that for the forthcoming voyage, vessel neither comes ex dry-dock nor tank washing held prior loading. 22 .BILL OF LADING FIGURES In case only net b(s)/l figures printed on the b(s)/l freight to be paid basis calculated gross b(s)/l figures, as calculated by charterers surveyor."
+      "title": "",
+      "text": "Owners confirm that all officers on board hold ocean going vessel certificate of competency. Also confirm that for the forthcoming voyage, vessel neither comes ex dry-dock nor tank washing held prior loading."
+    },
+    {
+      "id": "ERC-22",
+      "title": "BILL OF LADING FIGURES",
+      "text": "In case only net b(s)/l figures printed on the b(s)/l freight to be paid basis calculated gross b(s)/l figures, as calculated by charterers surveyor."
     }
   ]
 }

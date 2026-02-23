@@ -227,7 +227,13 @@ _CLAUSE_NUM_RE = re.compile(r"^(\d+)\.\s+(.*)$", re.DOTALL)
 # at the far-left margin (x < RIDER_NUM_X_MAX).  The number may be followed
 # immediately by the title (Essar format) or the title may be on the next line
 # (Shell Additional format).
-_RIDER_CLAUSE_NUM_RE = re.compile(r"^(\d+)[.)]+\s*(.*)")
+# Optional whitespace before the punctuation handles formats like "22 .TITLE".
+_RIDER_CLAUSE_NUM_RE = re.compile(r"^(\d+)\s*[.)]+\s*(.*)")
+
+# Maximum character length for text to be considered a clause title rather than
+# the opening line of the clause body.  Inline text longer than this threshold
+# is treated as body text and the title is left empty.
+RIDER_INLINE_TITLE_MAX_LEN = 60
 
 # Known section headers in the rider pages and their short prefix codes.
 _RIDER_SECTIONS: List[Tuple[str, str]] = [
@@ -492,14 +498,22 @@ def _extract_single_column_clauses(
                         _flush()
                         current_id = m.group(1)
                         current_id_section = current_section  # snapshot section at start
-                        inline_title = m.group(2).strip()
-                        if inline_title:
-                            current_title = inline_title
+                        inline_text = m.group(2).strip()
+                        if inline_text and len(inline_text) <= RIDER_INLINE_TITLE_MAX_LEN:
+                            # Short inline text → it is the clause title
+                            current_title = inline_text
                             awaiting_title = False
+                            current_body_parts = []
+                        elif inline_text:
+                            # Long inline text → it is the start of the body, no title
+                            current_title = None
+                            awaiting_title = False
+                            current_body_parts = [inline_text]
                         else:
+                            # No inline text → title follows on next line
                             current_title = None
                             awaiting_title = True
-                        current_body_parts = []
+                            current_body_parts = []
                         continue
 
                 if current_id is None:
