@@ -176,4 +176,3 @@ For the reference document (`voyage-charter-example.pdf`) the extractor produces
 
 - **Strikethrough text** is excluded throughout. The document contains numerous amended clauses where original SHELLVOY 5 text is struck through and replaced by rider text; only the live (non-struck) text is included in the output.
 - **Missing SHELLVOY 5 clause IDs** (e.g. 21, 27–29, 38, 39) correspond to clauses struck through in their entirety and replaced by custom rider clauses — their content is excluded per the task requirements.
-- **Source PDF** is not committed to the repository. Download it from the [original source](https://shippingforum.wordpress.com/wp-content/uploads/2012/09/voyage-charter-example.pdf) and place it in the project root as `voyage-charter-example.pdf` before running.
