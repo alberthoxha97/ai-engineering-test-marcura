@@ -66,10 +66,22 @@ WORD_STRIKE_COVERAGE_THRESHOLD = 0.3
 # ---------------------------------------------------------------------------
 
 def _get_strikethrough_rects(page: fitz.Page) -> List[fitz.Rect]:
-    """Return bounding boxes of all strikethrough decorations on *page*."""
+    """Return bounding boxes of all strikethrough decorations on *page*.
+
+    Strikethrough is stored in the PDF graphics layer as a thin filled
+    rectangle drawn on top of the text — not as a font property.  This
+    function reads that graphics layer and filters for hair-thin shapes
+    (height < 1 pt) which are exclusively used for strikethrough in these
+    documents.  All other shapes (borders, table lines, rules) are taller
+    and are ignored.
+    """
     rects = []
+    # Iterate every vector drawing object on the page (borders, lines, fills).
+    # Each drawing dict contains a "rect" key with the shape's bounding box.
     for drawing in page.get_drawings():
         r = fitz.Rect(drawing["rect"])
+        # Keep only hair-thin filled rectangles — these are strikethrough lines.
+        # Page borders and table rules are always taller than 1 pt.
         if 0 < r.height < STRIKETHROUGH_MAX_HEIGHT:
             rects.append(r)
     return rects
@@ -90,14 +102,19 @@ def _is_struck(line_bbox: Tuple, strike_rects: List[fitz.Rect]) -> bool:
         return False
 
     covered = 0.0
+    # Accumulate the total horizontal width covered by all overlapping strike rects.
     for sr in strike_rects:
         if not lr.intersects(sr):
+            # Fast reject — no overlap between this strike rect and the line at all.
             continue
-        # Horizontal overlap only
+        # Calculate the width of the horizontal overlap between the line and this rect.
+        # max(left edges) gives the overlap's left bound;
+        # min(right edges) gives the overlap's right bound.
         overlap = min(lr.x1, sr.x1) - max(lr.x0, sr.x0)
         if overlap > 0:
             covered += overlap
 
+    # If the combined coverage exceeds the threshold, the whole line is struck.
     return (covered / line_width) >= STRIKETHROUGH_COVERAGE_THRESHOLD
 
 
@@ -107,76 +124,129 @@ def _is_struck(line_bbox: Tuple, strike_rects: List[fitz.Rect]) -> bool:
 
 @dataclass
 class _TextLine:
-    """A text line with its position, visibility, and text."""
+    """A single visual line of text extracted from a PDF page.
+
+    x0    — left edge in PDF points; used to classify which column the line
+             belongs to (title column vs body column vs section header zone).
+    y0    — absolute y-coordinate (page-relative y + cumulative page offsets);
+             used by the two-column parser to match titles to clauses across pages.
+    text  — the visible text after strikethrough words have been removed.
+    struck — True when the line-level coverage check determined the whole line
+             is struck through.  Struck lines are kept in the list so the
+             two-column title matcher can still use their coordinates, but their
+             text is excluded from clause output.
+    """
     x0: float
     y0: float
     text: str
-    struck: bool = False  # True if the line is struck-through
+    struck: bool = False
 
 
 def _word_is_struck(
     word_bbox: Tuple[float, float, float, float],
     strike_rects: List[fitz.Rect],
 ) -> bool:
-    """Return True if the word's bbox is sufficiently covered by a strike rect."""
+    """Return True if this individual word is sufficiently covered by a strike rect.
+
+    Used for partial-strike lines where the line-level check (_is_struck) returned
+    False because less than 50% of the line is covered.  At word level, a 30%
+    coverage threshold is used because individual word bounding boxes are small
+    enough that a 30% overlap is a clear visual strikethrough of that word.
+    """
     wr = fitz.Rect(word_bbox)
     if wr.width <= 0:
+        # Degenerate bounding box (e.g. whitespace character) — treat as not struck
+        # to avoid division by zero.
         return False
+    # Check each strike rect against this word's bounding box.
     for sr in strike_rects:
         if not wr.intersects(sr):
+            # No overlap between this strike rect and the word — skip immediately.
             continue
+        # Measure horizontal overlap between the word and the strike rect.
         overlap = min(wr.x1, sr.x1) - max(wr.x0, sr.x0)
         if overlap / wr.width >= WORD_STRIKE_COVERAGE_THRESHOLD:
+            # At least 30% of the word's width is covered — consider it struck.
             return True
     return False
 
 
 def _extract_lines(page: fitz.Page, y_offset: float = 0.0) -> List[_TextLine]:
-    """Extract all text lines from *page*, sorted top-to-bottom.
+    """Extract all text lines from *page* as _TextLine objects, sorted top-to-bottom.
 
     *y_offset* is added to each line's y-coordinate so that lines across
     different pages have unique, monotonically increasing absolute y-values.
+    This is essential for the two-column parser which must match titles to
+    clause bodies across page boundaries using y-coordinate comparisons.
 
-    Lines are returned with their ``struck`` flag set.  Struck body lines are
-    still included so the parser can consume their associated title fragments.
+    Lines are returned with their ``struck`` flag set.  Struck lines are still
+    included (not discarded) so the two-column parser can use their coordinates
+    when assigning titles — even though their text will not appear in output.
 
-    For partially-struck lines (below STRIKETHROUGH_COVERAGE_THRESHOLD), struck
-    words are removed at the word level so that only the non-struck portion is
-    kept.
+    For partially-struck lines (line-level coverage below 50%), individual
+    struck words are removed using word-level bounding box analysis, and only
+    the surviving words are kept.
     """
     strike_rects = _get_strikethrough_rects(page)
 
-    # Build a word-level index keyed by (block_no, line_no) so we can reassemble
-    # cleaned text for partially-struck lines.
-    # get_text("words") returns (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+    # ------------------------------------------------------------------ #
+    # Build a word-level survival index for partial-strike filtering.     #
+    # Only populated when the page actually has strike rects.             #
+    # ------------------------------------------------------------------ #
+    # Maps (block_number, line_number) → list of non-struck word strings.
+    # Both numbers come from the "words" API and match the "dict" API's
+    # block/line indices, giving us a shared key between the two APIs.
     word_map: Dict[Tuple[int, int], List[str]] = {}
     if strike_rects:
+        # get_text("words") returns one tuple per word:
+        # (x0, y0, x1, y1, "word_text", block_no, line_no, word_no)
         for w in page.get_text("words", sort=True):
             x0, y0, x1, y1, word, bno, lno, _ = w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+            # Only keep words that are NOT struck — dropped words are simply
+            # never added to word_map, so they vanish when we reassemble.
             if not _word_is_struck((x0, y0, x1, y1), strike_rects):
                 word_map.setdefault((bno, lno), []).append(word)
 
     lines: List[_TextLine] = []
 
+    # ------------------------------------------------------------------ #
+    # Walk the page's text structure: blocks → lines → spans.            #
+    # ------------------------------------------------------------------ #
+    # get_text("dict") returns the full hierarchy with bounding boxes.
+    # sort=True ensures reading order (top-to-bottom, left-to-right).
     text_dict = page.get_text("dict", sort=True)
     for block in text_dict["blocks"]:
+        # type=0 is a text block; type=1 is an image block — skip images.
         if block["type"] != 0:
             continue
-        bno = block["number"]
+        bno = block["number"]  # block index on this page, used as part of word_map key
+
         for lno, line in enumerate(block["lines"]):
+            # A line can have multiple spans (e.g. bold + regular on same row).
+            # Join all span texts to get the complete visible text of this line.
             raw_text = "".join(s["text"] for s in line["spans"]).strip()
+
+            # Skip blank lines and standalone page numbers (e.g. "7" at page footer).
             if not raw_text or raw_text.isdigit():
                 continue
 
+            # Check if this entire line is struck (≥ 50% horizontal coverage).
             struck = bool(strike_rects and _is_struck(line["bbox"], strike_rects))
 
             if struck:
+                # Line is fully struck — keep raw_text unchanged.
+                # The two-column parser needs this line's coordinates to correctly
+                # assign titles to clauses, even though its text won't appear in output.
                 logger.debug("Struck line on page %d: %s…", page.number + 1, raw_text[:40])
                 text = raw_text
+
             elif strike_rects:
-                # Reassemble from non-struck words; fall back to raw if nothing filtered
+                # Page has strike rects but this line is not fully struck.
+                # Some individual words within it might still be struck —
+                # use word_map to reconstruct only the surviving words.
                 kept_words = word_map.get((bno, lno))
                 if kept_words is not None and len(kept_words) < len(raw_text.split()):
+                    # At least one word was removed — use the filtered version.
                     text = " ".join(kept_words)
                     if text != raw_text:
                         logger.debug(
@@ -185,17 +255,21 @@ def _extract_lines(page: fitz.Page, y_offset: float = 0.0) -> List[_TextLine]:
                             text[:60],
                         )
                 else:
+                    # No words were filtered — use raw_text to preserve spacing.
                     text = raw_text
+
             else:
+                # No strike rects on this page at all — fastest path, no filtering needed.
                 text = raw_text
 
+            # After word-level filtering a line might become empty (all words struck).
             if not text.strip():
                 continue
 
             lines.append(
                 _TextLine(
-                    x0=line["bbox"][0],
-                    y0=y_offset + line["bbox"][1],
+                    x0=line["bbox"][0],           # left edge — used for column classification
+                    y0=y_offset + line["bbox"][1], # absolute y — page-relative y + page offset
                     text=text,
                     struck=struck,
                 )
@@ -220,19 +294,21 @@ class RawClause:
 # Document-level extraction
 # ---------------------------------------------------------------------------
 
-# Pattern matching a clause-number prefix in the body column, e.g. "1. ", "15. "
+# Matches a SHELLVOY 5 two-column clause starter in the right body column.
+# Format: "N. rest of text" — e.g. "1. Owners shall exercise due diligence"
+# Group 1 = clause number, Group 2 = inline text after the number.
 _CLAUSE_NUM_RE = re.compile(r"^(\d+)\.\s+(.*)$", re.DOTALL)
 
-# Rider / additional sections: clause starters are lines where the number sits
-# at the far-left margin (x < RIDER_NUM_X_MAX).  The number may be followed
-# immediately by the title (Essar format) or the title may be on the next line
-# (Shell Additional format).
-# Optional whitespace before the punctuation handles formats like "22 .TITLE".
+# Matches a single-column clause starter at the far-left margin.
+# Handles Shell Additional format ("2."), Rider format ("1.  TITLE"),
+# and edge cases like "22 .TITLE" (optional whitespace before punctuation).
+# Group 1 = clause number, Group 2 = inline text after the number (may be empty).
 _RIDER_CLAUSE_NUM_RE = re.compile(r"^(\d+)\s*[.)]+\s*(.*)")
 
-# Maximum character length for text to be considered a clause title rather than
-# the opening line of the clause body.  Inline text longer than this threshold
-# is treated as body text and the title is left empty.
+# Maximum character length for text following a clause number to be treated
+# as a title rather than the opening sentence of the body.
+# "ARBITRATION CLAUSE" (18 chars) → title.
+# "The Owners shall not be responsible for..." (45+ chars) → body.
 RIDER_INLINE_TITLE_MAX_LEN = 60
 
 # In single-column pages, body text sits at x ≈ 50–149 pt.  Real section
@@ -281,12 +357,16 @@ def _is_section_header(text: str, x0: float) -> bool:
     structural, so any new section in any document will be picked up.
     """
     stripped = text.strip()
+    # Too short to be a meaningful heading — likely a stray word or list fragment.
     if len(stripped) < SECTION_HEADER_MIN_LEN:
         return False
+    # Body text continuations often start with a lowercase letter; real headings don't.
     if stripped[0].islower():
         return False
+    # A clause number like "1." or "22 .TITLE" is not a section header.
     if _RIDER_CLAUSE_NUM_RE.match(stripped):
         return False
+    # Final check: must be positioned in the centred heading zone (x ≥ 150 pt).
     return x0 >= SECTION_HEADER_MIN_X
 
 
@@ -303,12 +383,16 @@ def _prefix_from_header(text: str) -> str:
     ``"Special Provisions Section"``                     → ``"SPS"``
     ``"Maritime Freight Addendum"``                      → ``"MFA"``
     """
+    # Extract only alphabetic words — strips punctuation, numbers, brackets.
     words = re.findall(r"[A-Za-z]+", text)
+    # Take the first letter of each significant word, skipping stop-words
+    # and short words that carry no distinguishing information.
     initials = [
         w[0].upper()
         for w in words
         if w.upper() not in _PREFIX_STOP_WORDS and len(w) > 2
     ]
+    # Use up to 3 initials for a compact prefix; fall back to "SEC" if nothing qualifies.
     return "".join(initials[:3]) if initials else "SEC"
 
 
@@ -332,6 +416,7 @@ def _has_two_column_layout(page: fitz.Page) -> bool:
     has_title_col = False
     has_right_col = False
 
+    # Scan every line on the page looking for evidence of both columns.
     for block in page.get_text("dict", sort=True)["blocks"]:
         if block["type"] != 0:
             continue
@@ -341,22 +426,29 @@ def _has_two_column_layout(page: fitz.Page) -> bool:
                 continue
             x0 = line["bbox"][0]
             if x0 < TITLE_COLUMN_MAX_X:
-                # Exclude lines that are themselves clause-number starters
-                # (e.g. "2." or "3.  Insurance Clause") so that single-column
-                # pages whose number sits at x ≈ 50 aren't misclassified.
+                # Left column candidate — but exclude clause-number lines
+                # (e.g. "2." at x≈50) that appear on single-column pages.
+                # Those would otherwise trigger a false two-column classification.
                 if not _RIDER_CLAUSE_NUM_RE.match(text):
                     has_title_col = True
             elif _CLAUSE_NUM_RE.match(text):
+                # Right column clause starter found — confirms body column exists.
                 has_right_col = True
 
+        # Early exit as soon as both columns are confirmed — no need to scan further.
         if has_title_col and has_right_col:
             return True
 
     return has_title_col and has_right_col
 
 
-def _parse_clauses_from_lines(all_lines: List[_TextLine]) -> List[RawClause]:
-    """Convert a flat list of positioned text lines into structured clauses.
+def _parse_two_column_clauses(all_lines: List[_TextLine]) -> List[RawClause]:
+    """Extract clauses from two-column (SHELLVOY 5 style) pages.
+
+    In the two-column layout, clause titles appear in the left column
+    (x < TITLE_COLUMN_MAX_X) and clause bodies appear in the right column
+    (x >= TITLE_COLUMN_MAX_X).  Titles and bodies are matched by their
+    absolute y-coordinates across all two-column pages.
 
     Two-pass algorithm
     ------------------
@@ -381,7 +473,10 @@ def _parse_clauses_from_lines(all_lines: List[_TextLine]) -> List[RawClause]:
     # title lines to them.                                                 #
     # ------------------------------------------------------------------ #
 
-    # All clause starters: (abs_y, clause_id, is_struck)
+    # Build a sorted list of every clause starter seen in the right column.
+    # Each entry is (absolute_y, clause_id_string, is_struck).
+    # Sorting by y ensures top-to-bottom document order regardless of
+    # the order lines were extracted from individual pages.
     starters: List[Tuple[float, str, bool]] = []
     for line in all_lines:
         if line.x0 >= TITLE_COLUMN_MAX_X:
@@ -392,14 +487,22 @@ def _parse_clauses_from_lines(all_lines: List[_TextLine]) -> List[RawClause]:
 
     # Small tolerance (in points) to handle sub-pixel floating-point differences
     # between title line y-coordinates and their corresponding body line y-coordinates.
+    # A title rendered at y=302.4 and its clause at y=301.1 should be considered
+    # the same vertical position — 1.5 pt absorbs that without crossing into
+    # the clause above.
     Y_EPSILON = 1.5
 
-    # Map clause_id → list of title texts, using "most recent starter ≤ title_y"
+    # Map clause_id → list of title text fragments belonging to that clause.
+    # A clause can have multiple title lines (multi-line heading); they are
+    # collected in document order and joined with spaces at output time.
     clause_titles: Dict[str, List[str]] = {}
     for line in all_lines:
+        # Only process left-column lines — these are the title fragments.
         if line.x0 >= TITLE_COLUMN_MAX_X:
             continue
-        # Find the last starter whose y ≤ this title line's y (with tolerance)
+        # Walk backwards through the sorted starters list to find the last
+        # clause starter whose y is at or above this title line's y.
+        # "At or above" = the clause that this title visually aligns with.
         assigned_id: Optional[str] = None
         for (sy, sid, _struck) in reversed(starters):
             if sy <= line.y0 + Y_EPSILON:
@@ -409,6 +512,7 @@ def _parse_clauses_from_lines(all_lines: List[_TextLine]) -> List[RawClause]:
             clause_titles.setdefault(assigned_id, []).append(line.text)
 
     def _title_for(clause_id: str) -> str:
+        """Join all collected title fragments for this clause into one string."""
         parts = clause_titles.get(clause_id, [])
         return " ".join(parts).strip()
 
@@ -417,40 +521,55 @@ def _parse_clauses_from_lines(all_lines: List[_TextLine]) -> List[RawClause]:
     # ------------------------------------------------------------------ #
 
     clauses: List[RawClause] = []
-    # Track struck-clause titles so they can be inherited by their replacements
+    # When a clause is struck and replaced by a new version of the same number,
+    # the title was assigned to the struck version in pass 1.  We save it here
+    # so the replacement clause can inherit it.
     struck_titles: Dict[str, str] = {}
 
     current_id: Optional[str] = None
     current_body_parts: List[str] = []
-    in_struck_clause = False
+    in_struck_clause = False  # True while accumulating lines for a struck clause
 
     def _flush() -> None:
+        """Save the currently open clause to the output list.
+
+        Only saves non-struck clauses that have body text.
+        Inherits the title from a struck predecessor if the clause has none.
+        """
         if current_id is not None and not in_struck_clause:
             body = " ".join(current_body_parts).strip()
             title = _title_for(current_id)
-            # Inherit from the struck version if this clause has no title of its own
+            # If this clause has no title of its own, it may be a replacement
+            # for a struck clause whose title was assigned to the struck version.
             if not title and current_id in struck_titles:
                 title = struck_titles[current_id]
             clauses.append(RawClause(id=current_id, title=title, text=body))
 
+    # Walk right-column lines sequentially to assemble clause bodies.
+    # Left-column lines (titles) were fully handled in pass 1 above.
     for line in all_lines:
         if line.x0 < TITLE_COLUMN_MAX_X:
-            continue  # title lines handled in pass 1
+            continue  # left-column title lines — already processed in pass 1
 
         m = _CLAUSE_NUM_RE.match(line.text)
         if m:
+            # New clause starter found — save the previous clause first, then open this one.
             _flush()
             current_id = m.group(1)
+            # Include any text on the same line as the number (e.g. "1. Owners shall...")
             current_body_parts = [m.group(2)] if m.group(2).strip() else []
             in_struck_clause = line.struck
             if line.struck:
-                # Save struck title for potential inheritance
+                # Save this struck clause's title so the replacement clause can inherit it.
                 struck_titles[current_id] = _title_for(current_id)
         else:
+            # Body continuation line — skip if no clause is open, if we are inside
+            # a struck clause, or if this individual line is struck.
             if current_id is None or in_struck_clause or line.struck:
                 continue
             current_body_parts.append(line.text)
 
+    # Save the last open clause — there is no following clause starter to trigger _flush.
     _flush()
     return clauses
 
@@ -484,39 +603,55 @@ def _extract_single_column_clauses(
     and are incorporated into the clause body text.
     """
     # ------------------------------------------------------------------ #
-    # State variables                                                     #
+    # State variables — the parser's memory between lines and pages.     #
     # ------------------------------------------------------------------ #
-    section_counter = 0          # increments every time a new section opens
-    current_section = ""         # prefix for the open section (e.g. "SAC")
-    pending_header: Optional[str] = None  # header candidate seen since last body line
-    body_since_header = False    # True once body text is added after pending_header
+    section_counter = 0          # incremented each time a new section opens; used for fallback prefix "S1", "S2"
+    current_section = ""         # active section prefix e.g. "SAC", "ERC"
+    pending_header: Optional[str] = None  # section heading seen but not yet confirmed
+    body_since_header = False    # becomes True when body text appears after a pending_header,
+                                 # which means the "header" was actually inside a clause body
 
-    current_id: Optional[str] = None
-    current_id_section = ""      # section snapshotted when the clause started
-    current_title: Optional[str] = None
-    current_body_parts: List[str] = []
-    awaiting_title = False
+    current_id: Optional[str] = None       # clause number currently being built e.g. "1", "43"
+    current_id_section = ""                # section prefix at the moment this clause started;
+                                           # snapshotted so section changes mid-clause don't corrupt the id
+    current_title: Optional[str] = None   # title of the clause being built
+    current_body_parts: List[str] = []    # accumulated body lines for the current clause
+    awaiting_title = False                 # True after a standalone number line, before the title line arrives
 
-    # Tracking for numbering-reset detection
-    section_max_num = 0          # highest clause number seen in current section
-    section_clause_count = 0     # how many clauses we have opened in this section
+    # Used to detect when the clause numbering resets (e.g. 43 → 1),
+    # which signals a new section even if no section header was found.
+    section_max_num = 0          # highest clause number seen in the current section
+    section_clause_count = 0     # total clauses opened in the current section
 
     clauses: List[RawClause] = []
 
     def _open_section(header_text: Optional[str]) -> str:
-        """Start a new section and return its prefix.
+        """Open a new section, reset per-section counters, and return the new prefix.
 
-        The prefix is derived from *header_text* when provided; otherwise a
-        sequential fallback label ``S1``, ``S2``, … is used.
+        If *header_text* is provided, the prefix is derived from it (e.g.
+        "SHELL ADDITIONAL CLAUSES" → "SAC").  Otherwise a sequential fallback
+        label "S1", "S2", … is used when a section boundary was detected by
+        numbering reset with no visible heading.
         """
         nonlocal section_counter, section_max_num, section_clause_count
         section_counter += 1
+        # Reset counters so numbering-reset detection starts fresh in the new section.
         section_max_num = 0
         section_clause_count = 0
         return _prefix_from_header(header_text) if header_text else f"S{section_counter}"
 
     def _flush() -> None:
+        """Save the currently open clause to the output list.
+
+        Guards: does nothing if no clause is open (current_id is None) or if
+        the clause has no body text — a bare clause number with no content is
+        not a real clause.
+        """
         if current_id is not None and current_body_parts:
+            # Build the full prefixed id e.g. "SAC-1", "ERC-22".
+            # Uses current_id_section (snapshotted at clause open time) not
+            # current_section, so a section change between open and flush
+            # does not corrupt this clause's id.
             full_id = f"{current_id_section}-{current_id}"
             clauses.append(
                 RawClause(
@@ -526,36 +661,49 @@ def _extract_single_column_clauses(
                 )
             )
 
+    # ------------------------------------------------------------------ #
+    # Main loop — iterate pages, then blocks, then lines.                #
+    # State persists across pages so a clause spanning a page boundary   #
+    # is assembled correctly.                                             #
+    # ------------------------------------------------------------------ #
     for page_num in page_nums:
         page = doc[page_num]
         strike_rects = _get_strikethrough_rects(page)
 
-        # Build word-level strike map for partial-line filtering
+        # Build the word-level survival index for partial-strike filtering.
+        # Only runs when the page has strike rects — most single-column pages don't.
         word_map: Dict[Tuple[int, int], List[str]] = {}
         if strike_rects:
             for w in page.get_text("words", sort=True):
                 x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
                 word, bno, lno = w[4], w[5], w[6]
+                # Only add non-struck words; struck words are simply omitted from the map.
                 if not _word_is_struck((x0, y0, x1, y1), strike_rects):
                     word_map.setdefault((bno, lno), []).append(word)
 
         text_dict = page.get_text("dict", sort=True)
         for block in text_dict["blocks"]:
             if block["type"] != 0:
-                continue
+                continue  # skip image blocks
             bno = block["number"]
+
             for lno, line in enumerate(block["lines"]):
+                # Reconstruct the full visible text of this line by joining all spans.
                 raw_text = "".join(s["text"] for s in line["spans"]).strip()
                 if not raw_text or raw_text.isdigit():
-                    continue
+                    continue  # skip blank lines and page-number footers
 
                 x0 = line["bbox"][0]
                 struck = bool(strike_rects and _is_struck(line["bbox"], strike_rects))
 
                 if struck:
-                    continue  # skip wholly struck lines in rider section
+                    # Entire line is struck — discard immediately.
+                    # Unlike the two-column parser we don't need struck lines for
+                    # coordinate reference, so we can drop them right here.
+                    continue
 
-                # Apply partial word-level strike filtering
+                # Apply partial word-level strike filtering for lines that are not
+                # fully struck but may still contain individually struck words.
                 if strike_rects:
                     kept = word_map.get((bno, lno))
                     text = (
@@ -564,42 +712,55 @@ def _extract_single_column_clauses(
                         else raw_text
                     )
                 else:
+                    # No strike rects on this page — use raw text directly.
                     text = raw_text
 
+                # After word filtering the line might be empty (all words were struck).
                 if not text.strip():
                     continue
 
                 # ---------------------------------------------------- #
-                # Section header detection (position-based, generic)   #
+                # Decision 1 — Section header candidate                 #
+                # Centred headings sit at x ≥ 150 pt, are ≥ 10 chars,  #
+                # start with a capital, and are not clause numbers.     #
                 # ---------------------------------------------------- #
                 if _is_section_header(text, x0):
-                    # Record as a candidate; only activate when a numbered
-                    # clause follows with no intervening body text.
+                    # Store as a candidate — do not open the section yet.
+                    # The section only opens when a numbered clause immediately
+                    # follows with no body text in between (body_since_header guard).
                     pending_header = text
                     body_since_header = False
                     logger.debug("Section header candidate: %s", text[:60])
                     continue
 
                 # ---------------------------------------------------- #
-                # Top-level clause starter: number at leftmost margin   #
+                # Decision 2 — Top-level clause starter                 #
+                # Number must be at the far-left margin (x < 60 pt).   #
+                # Sub-clauses like "1) Oil Pollution" are indented to   #
+                # x ≈ 86 and fail this check — they become body text.  #
                 # ---------------------------------------------------- #
                 if x0 < RIDER_NUM_X_MAX:
                     m = _RIDER_CLAUSE_NUM_RE.match(text)
                     if m:
                         new_num = int(m.group(1))
 
-                        # Detect numbering reset even without an explicit header
+                        # Detect a numbering reset (e.g. clause counter jumps from
+                        # 43 back to 1), which signals a new section even when there
+                        # is no visible section heading between the two sections.
                         numbering_reset = (
                             new_num <= SECTION_RESET_NEW_MAX
                             and section_max_num >= SECTION_RESET_PREV_MIN
                             and section_clause_count >= SECTION_RESET_PREV_MIN
                         )
 
-                        # A header candidate is valid only when NO body text
-                        # has been added since it was seen.  If body text did
-                        # follow, the "header" was inside a clause body — discard it.
+                        # A pending_header is only valid if no body text appeared
+                        # between the heading and this clause number.  If body text
+                        # did appear, the "heading" was a deeply indented body line
+                        # that falsely looked like a header — discard it.
                         valid_header = pending_header and not body_since_header
 
+                        # Open a new section when: a valid header was found, or no
+                        # section has been opened yet, or the numbering reset.
                         if valid_header or (not current_section) or numbering_reset:
                             current_section = _open_section(
                                 pending_header if valid_header else None
@@ -609,44 +770,73 @@ def _extract_single_column_clauses(
                                 current_section, numbering_reset,
                                 pending_header if valid_header else None,
                             )
+
+                        # Consume the header candidate regardless of whether it was used.
                         pending_header = None
                         body_since_header = False
 
+                        # Save the previous clause before opening this one.
                         _flush()
+
                         current_id = m.group(1)
-                        current_id_section = current_section  # snapshot section at start
+                        # Snapshot the section prefix NOW so that if the section changes
+                        # before this clause is flushed, the id still reflects the
+                        # section where the clause actually started.
+                        current_id_section = current_section
                         section_max_num = max(section_max_num, new_num)
                         section_clause_count += 1
+
                         inline_text = m.group(2).strip()
                         if inline_text and len(inline_text) <= RIDER_INLINE_TITLE_MAX_LEN:
-                            # Short inline text → it is the clause title
+                            # Short text after the number (≤ 60 chars) → clause title.
+                            # e.g. "1.  ARBITRATION CLAUSE" → title = "ARBITRATION CLAUSE"
                             current_title = inline_text
                             awaiting_title = False
                             current_body_parts = []
                         elif inline_text:
-                            # Long inline text → it is the start of the body, no title
+                            # Long text after the number (> 60 chars) → opening sentence
+                            # of the body.  No separate title line exists for this clause.
                             current_title = None
                             awaiting_title = False
                             current_body_parts = [inline_text]
                         else:
-                            # No inline text → title follows on next line
+                            # Nothing after the number (e.g. bare "2.") → title is on
+                            # the very next non-empty line.  Set the flag to capture it.
                             current_title = None
                             awaiting_title = True
                             current_body_parts = []
                         continue
 
+                # ---------------------------------------------------- #
+                # Decision 3 — No clause open yet                       #
+                # Lines before the first clause number are discarded    #
+                # (title page, Part I form fields, page headers, etc.). #
+                # ---------------------------------------------------- #
                 if current_id is None:
                     continue
 
-                # Assign first line after a standalone number as the title
+                # ---------------------------------------------------- #
+                # Decision 4 — Awaiting title                           #
+                # Only active after a standalone number line ("2.").    #
+                # The very next line becomes the clause title.          #
+                # ---------------------------------------------------- #
                 if awaiting_title:
                     current_title = text
                     awaiting_title = False
                     continue
 
+                # ---------------------------------------------------- #
+                # Decision 5 — Body text                                #
+                # Everything that reaches here belongs to the body of   #
+                # the currently open clause.                            #
+                # ---------------------------------------------------- #
                 current_body_parts.append(text)
-                body_since_header = True  # body text followed → discard any pending header
+                # Mark that real body content has appeared since the last header
+                # candidate.  This invalidates any pending_header that was set
+                # while we were inside this clause body.
+                body_since_header = True
 
+    # Save the last open clause — no following clause starter will trigger _flush.
     _flush()
     logger.info("Single-column parser: %d clauses from %d pages", len(clauses), len(page_nums))
     return clauses
@@ -660,7 +850,7 @@ def extract_clauses_from_pdf(pdf_path: Path) -> Tuple[List[RawClause], int]:
 
     Three parser strategies are applied:
 
-    1. **Two-column parser** (``_parse_clauses_from_lines``) — used for pages
+    1. **Two-column parser** (``_parse_two_column_clauses``) — used for pages
        where title-fragment text appears in the left column and numbered clause
        bodies appear in the right column (SHELLVOY 5 style).
 
@@ -681,7 +871,8 @@ def extract_clauses_from_pdf(pdf_path: Path) -> Tuple[List[RawClause], int]:
     logger.info("Opened '%s' (%d pages total)", pdf_path.name, total_pages)
 
     # ------------------------------------------------------------------ #
-    # Step 1 – Classify every page as two-column or single-column         #
+    # Step 1 – Classify every page as two-column or single-column.       #
+    # Pages are inspected by content, not by page number.                #
     # ------------------------------------------------------------------ #
     two_col_pages: List[int] = []
     single_col_pages: List[int] = []
@@ -702,24 +893,31 @@ def extract_clauses_from_pdf(pdf_path: Path) -> Tuple[List[RawClause], int]:
     all_clauses: List[RawClause] = []
 
     # ------------------------------------------------------------------ #
-    # Step 2 – Parser 1: two-column (SHELLVOY 5 style)                   #
+    # Step 2 – Two-column parser (SHELLVOY 5 style).                     #
+    # All two-column pages are merged into a single line list first so   #
+    # that the two-pass title matcher can work across page boundaries    #
+    # using absolute y-coordinates.                                      #
     # ------------------------------------------------------------------ #
     if two_col_pages:
         all_lines: List[_TextLine] = []
-        y_offset = 0.0
+        y_offset = 0.0  # accumulates page heights to produce absolute y-coordinates
         for page_num in two_col_pages:
             page = doc[page_num]
             page_lines = _extract_lines(page, y_offset=y_offset)
             all_lines.extend(page_lines)
+            # Advance offset by this page's height so the next page's lines
+            # have y-coordinates that are strictly greater than this page's.
             y_offset += page.rect.height
             logger.debug("Two-col page %d: %d lines", page_num + 1, len(page_lines))
 
-        shellvoy_clauses = _parse_clauses_from_lines(all_lines)
+        shellvoy_clauses = _parse_two_column_clauses(all_lines)
         logger.info("Two-column parser: %d clauses", len(shellvoy_clauses))
         all_clauses.extend(shellvoy_clauses)
 
     # ------------------------------------------------------------------ #
-    # Step 3 – Parsers 2 & 3: single-column (Shell Additional + Rider)   #
+    # Step 3 – Single-column parser (Shell Additional + Rider styles).   #
+    # Pages are passed as a list; the parser's state machine carries     #
+    # over between pages so cross-page clauses are assembled correctly.  #
     # ------------------------------------------------------------------ #
     if single_col_pages:
         single_clauses = _extract_single_column_clauses(doc, single_col_pages)
@@ -739,9 +937,15 @@ def extract_clauses_from_pdf(pdf_path: Path) -> Tuple[List[RawClause], int]:
 def get_part_ii_plain_text(pdf_path: Path) -> Tuple[str, int]:
     """Return the plain text of all clause pages with strikethrough removed.
 
-    Only pages that contain clause content (two-column or single-column with
-    numbered clauses) are included.  Determined by layout detection, not page
-    numbers.  Also returns the number of pages included.
+    Produces a flat, human-readable string with page markers ([PAGE N]) that
+    the LLM receives as input.  The LLM reads this as a document and extracts
+    clauses with its language understanding — independent of the layout parser.
+
+    Unlike the layout parsers, this function does not classify lines by column
+    or x-position.  It simply collects every non-struck line from every page,
+    preserving the original reading order.
+
+    Also returns the total number of pages that contained visible text.
     """
     pdf_path = Path(pdf_path)
     doc = fitz.open(str(pdf_path))
@@ -749,15 +953,22 @@ def get_part_ii_plain_text(pdf_path: Path) -> Tuple[str, int]:
 
     parts: List[str] = []
     pages = 0
-    y_offset = 0.0
+    y_offset = 0.0  # passed to _extract_lines but not used by this function —
+                    # absolute y-coordinates are irrelevant when only collecting text
+
+    # Process every page and collect its non-struck lines into a labelled block.
     for page_num in range(total_pages):
         page = doc[page_num]
+        # _extract_lines handles strikethrough detection and returns _TextLine objects
+        # with a struck flag — we filter to only the visible (non-struck) lines.
         lines = _extract_lines(page, y_offset=y_offset)
         y_offset += page.rect.height
         visible = [ln.text for ln in lines if not ln.struck]
         if visible:
+            # Label each page so the LLM knows where page breaks occur.
             parts.append(f"[PAGE {page_num + 1}]\n" + "\n".join(visible))
             pages += 1
 
     doc.close()
+    # Join all page blocks with a blank line between them.
     return "\n\n".join(parts), pages
